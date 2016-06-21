@@ -1,6 +1,13 @@
-#cobra.manipulation.modify.py
 import re
 from copy import deepcopy
+from warnings import warn
+from ast import NodeTransformer, And
+
+from six import iteritems, string_types
+
+from ..core.Gene import eval_gpr, parse_gpr, ast2str
+
+
 def prune_unused_metabolites(cobra_model):
     """Removes metabolites that aren't involved in any reactions in the model
 
@@ -18,18 +25,18 @@ def prune_unused_metabolites(cobra_model):
     if inactive_metabolites:
         return inactive_metabolites
     else:
-        print 'All metabolites used in at least 1 reaction'
+        warn('All metabolites used in at least 1 reaction')
 
-    
+
 def prune_unused_reactions(cobra_model):
-    """Removes reactions from cobra_model.  
+    """Removes reactions from cobra_model.
 
     cobra_model: A Model object.
 
-    reactions_to_prune: None, a string matching a reaction.id, a cobra.Reaction, or
-    as list of the ids / Reactions to remove from cobra_model.
-    If None then the function will delete reactions that
-    have no active metabolites in the model.
+    reactions_to_prune: None, a string matching a reaction.id, a
+    cobra.Reaction, or as list of the ids / Reactions to remove from
+    cobra_model.  If None then the function will delete reactions that have no
+    active metabolites in the model.
 
     """
     pruned_reactions = []
@@ -40,140 +47,184 @@ def prune_unused_reactions(cobra_model):
             the_reaction.remove_from_model(cobra_model)
             pruned_reactions.append(the_reaction)
         except:
-            print '%s not in %s'%(the_reaction.id,
-                                      cobra_model.id)
+            warn('%s not in %s' % (the_reaction.id, cobra_model.id))
     if not pruned_reactions:
-        print 'All reactions have at least 1 metabolite'
+        warn('All reactions have at least 1 metabolite')
         return
 
 
 def undelete_model_genes(cobra_model):
-    """Undoes the effects of a call to delete_model_genes. Modifies cobra_model in place.
+    """Undoes the effects of a call to delete_model_genes in place.
 
-    cobra_model:  A cobra.Model object
+    cobra_model:  A cobra.Model which will be modified in place
 
     """
 
     if cobra_model._trimmed_genes is not None:
-        [setattr(x, 'functional', True)
-         for x in cobra_model._trimmed_genes]
-    
+        for x in cobra_model._trimmed_genes:
+            x.functional = True
+
     if cobra_model._trimmed_reactions is not None:
-        for the_reaction, (lower_bound,
-                           upper_bound) in cobra_model._trimmed_reactions.items():
+        for the_reaction, (lower_bound, upper_bound) in \
+                cobra_model._trimmed_reactions.items():
             the_reaction.lower_bound = lower_bound
             the_reaction.upper_bound = upper_bound
-    #
-    cobra_model._trimmed_genes = None
-    cobra_model._trimmed_reactions = None
-    cobra_model._trimmed = False
-    #Reset these to deal with potential bugs from users accessing private variables
-    for the_attribute in  ['_lower_bounds', '_upper_bounds',
-                           '_S', '_objective_coefficients']:
-        if hasattr(cobra_model, the_attribute):
-            setattr(cobra_model, the_attribute, None)
 
-        
+    cobra_model._trimmed_genes = []
+    cobra_model._trimmed_reactions = {}
+    cobra_model._trimmed = False
+
+
+def get_compiled_gene_reaction_rules(cobra_model):
+    """Generates a dict of compiled gene_reaction_rules
+
+    Any gene_reaction_rule expressions which cannot be compiled or do not
+    evaluate after compiling will be excluded. The result can be used in the
+    find_gene_knockout_reactions function to speed up evaluation of these
+    rules.
+
+    """
+    return {r: parse_gpr(r.gene_reaction_rule)[0]
+            for r in cobra_model.reactions}
+
+
+def find_gene_knockout_reactions(cobra_model, gene_list,
+                                 compiled_gene_reaction_rules=None):
+    """identify reactions which will be disabled when the genes are knocked out
+
+    cobra_model: :class:`~cobra.core.Model.Model`
+
+    gene_list: iterable of :class:`~cobra.core.Gene.Gene`
+
+    compiled_gene_reaction_rules: dict of {reaction_id: compiled_string}
+        If provided, this gives pre-compiled gene_reaction_rule strings.
+        The compiled rule strings can be evaluated much faster. If a rule
+        is not provided, the regular expression evaluation will be used.
+        Because not all gene_reaction_rule strings can be evaluated, this
+        dict must exclude any rules which can not be used with eval.
+
+    """
+    potential_reactions = set()
+    for gene in gene_list:
+        if isinstance(gene, string_types):
+            gene = cobra_model.genes.get_by_id(gene)
+        potential_reactions.update(gene._reaction)
+    gene_set = {str(i) for i in gene_list}
+    if compiled_gene_reaction_rules is None:
+        compiled_gene_reaction_rules = {r: parse_gpr(r.gene_reaction_rule)[0]
+                                        for r in potential_reactions}
+
+    return [r for r in potential_reactions
+            if not eval_gpr(compiled_gene_reaction_rules[r], gene_set)]
+
 
 def delete_model_genes(cobra_model, gene_list,
-                       cumulative_deletions=False, disable_orphans=False):
+                       cumulative_deletions=True, disable_orphans=False):
     """delete_model_genes will set the upper and lower bounds for reactions
-    catalyzed by the genes in gene_list if deleting the genes means that
+    catalysed by the genes in gene_list if deleting the genes means that
     the reaction cannot proceed according to
     cobra_model.reactions[:].gene_reaction_rule
 
     cumulative_deletions: False or True.  If True then any previous
     deletions will be maintained in the model.
 
-    TODO: Rewrite to use dicts for _trimmed*
-
-    TODO: All this will be replaced by Boolean logic associated with
-    #the cobra.Gene.functional in cobra.Reaction.gene_reaction_rule
-
-    TODO: Update this to refer to cobra.(Gene|Reaction) in the
-    _trimmed_(genes|reactions) fields and remove _trimmed_indices
-    
     """
-    if not hasattr(cobra_model, '_trimmed') or not cumulative_deletions:
+    if disable_orphans:
+        raise NotImplementedError("disable_orphans not implemented")
+    if not hasattr(cobra_model, '_trimmed'):
         cobra_model._trimmed = False
         cobra_model._trimmed_genes = []
-        cobra_model._trimmed_reactions = {} #Store the old bounds in here.
-    spontaneous_re = re.compile('(^|(?<=( |\()))s0001(?=( |\)|$))')
-    #Allow a single gene to be fed in as a string instead of a list.
+        cobra_model._trimmed_reactions = {}  # Store the old bounds in here.
+    # older models have this
+    if cobra_model._trimmed_genes is None:
+        cobra_model._trimmed_genes = []
+    if cobra_model._trimmed_reactions is None:
+        cobra_model._trimmed_reactions = {}
+    # Allow a single gene to be fed in as a string instead of a list.
     if not hasattr(gene_list, '__iter__') or \
-           hasattr(gene_list, 'id'):  #cobra.Gene has __iter__
+            hasattr(gene_list, 'id'):  # cobra.Gene has __iter__
         gene_list = [gene_list]
 
     if not hasattr(gene_list[0], 'id'):
         if gene_list[0] in cobra_model.genes:
                 tmp_gene_dict = dict([(x.id, x) for x in cobra_model.genes])
         else:
-            #assume we're dealing with names if no match to an id
+            # assume we're dealing with names if no match to an id
             tmp_gene_dict = dict([(x.name, x) for x in cobra_model.genes])
         gene_list = [tmp_gene_dict[x] for x in gene_list]
 
-    #Make the genes non-functional
-    [setattr(x, 'functional', False)
-     for x in gene_list]
-    the_reactions = set()
-    [the_reactions.update(x._reaction)
-     for x in gene_list]
-    for the_reaction in the_reactions:
+    # Make the genes non-functional
+    for x in gene_list:
+        x.functional = False
+
+    if cumulative_deletions:
+        gene_list.extend(cobra_model._trimmed_genes)
+    else:
+        undelete_model_genes(cobra_model)
+
+    for the_reaction in find_gene_knockout_reactions(cobra_model, gene_list):
+        # Running this on an already deleted reaction will overwrite the
+        # stored reaction bounds.
+        if the_reaction in cobra_model._trimmed_reactions:
+            continue
         old_lower_bound = the_reaction.lower_bound
         old_upper_bound = the_reaction.upper_bound
-        the_gene_reaction_relation = deepcopy(the_reaction.gene_reaction_rule)
-        for the_gene in the_reaction._genes:
-            the_gene_re = re.compile('(^|(?<=( |\()))%s(?=( |\)|$))'%re.escape(the_gene.id))
-            if the_gene in gene_list:
-                the_gene_reaction_relation = the_gene_re.sub('False', the_gene_reaction_relation)
-            else:
-                the_gene_reaction_relation = the_gene_re.sub('True', the_gene_reaction_relation)
-        the_gene_reaction_relation = spontaneous_re.sub('True', the_gene_reaction_relation)
-        if not eval(the_gene_reaction_relation):
-            cobra_model._trimmed_reactions[the_reaction] = (old_lower_bound,
-                                                            old_upper_bound)
-            the_reaction.lower_bound = 0.
-            the_reaction.upper_bound = 0.
-            cobra_model._trimmed = True
+        cobra_model._trimmed_reactions[the_reaction] = (old_lower_bound,
+                                                        old_upper_bound)
+        the_reaction.lower_bound = 0.
+        the_reaction.upper_bound = 0.
+        cobra_model._trimmed = True
 
-    cobra_model._trimmed_genes =  list(set(cobra_model._trimmed_genes + gene_list))
+    cobra_model._trimmed_genes = list(set(cobra_model._trimmed_genes +
+                                          gene_list))
 
 
+class _GeneRemover(NodeTransformer):
+    def __init__(self, target_genes):
+        NodeTransformer.__init__(self)
+        self.target_genes = {str(i) for i in target_genes}
 
-if __name__ == '__main__':
-    from time import time
-    from cobra.test import create_test_model
-    cobra_model = create_test_model()
+    def visit_Name(self, node):
+        return None if node.id in self.target_genes else node
 
-    print "move to test"
-    #TODO: Add in tests for each function
-    cumulative_deletions=False
-    disable_orphans=False
-    gene_list = ['STM1067', 'STM0227']
-    #The following reactions are trimmed when STM1332 and STM1101 are deleted
-    dependent_reactions = set(['3HAD121',
-                               '3HAD160',
-                               '3HAD80',
-                               '3HAD140',
-                               '3HAD180',
-                               '3HAD100',
-                               '3HAD181',
-                               '3HAD120',
-                               '3HAD60',
-                               '3HAD141',
-                               '3HAD161',
-                               'T2DECAI',
-                               '3HAD40'])
-    delete_model_genes(cobra_model, gene_list)
-    symmetric_difference = dependent_reactions.symmetric_difference([x.id for x in cobra_model._trimmed_reactions])
-    if len(symmetric_difference) == 0:
-        print 'Successful deletion of %s'%repr(gene_list)
-    else:
-        print 'Failed deletion of %s\n%s reactions did not match'%(repr(gene_list),
-                                                                   repr(symmetric_difference))
+    def visit_BoolOp(self, node):
+        original_n = len(node.values)
+        self.generic_visit(node)
+        if len(node.values) == 0:
+            return None
+        # AND with any entities removed
+        if len(node.values) < original_n and isinstance(node.op, And):
+            return None
+        # if one entity in an OR was removed, just that entity passed up
+        if len(node.values) == 1:
+            return node.values[0]
+        return node
 
 
+def remove_genes(cobra_model, gene_list, remove_reactions=True):
+    """remove genes entirely from the model
 
-
-
-
+    This will also simplify all gene_reaction_rules with this
+    gene inactivated."""
+    gene_set = {cobra_model.genes.get_by_id(str(i)) for i in gene_list}
+    gene_id_set = {i.id for i in gene_set}
+    remover = _GeneRemover(gene_id_set)
+    ast_rules = get_compiled_gene_reaction_rules(cobra_model)
+    target_reactions = []
+    for reaction, rule in iteritems(ast_rules):
+        if reaction.gene_reaction_rule is None or \
+                len(reaction.gene_reaction_rule) == 0:
+            continue
+        # reactions to remove
+        if remove_reactions and not eval_gpr(rule, gene_id_set):
+            target_reactions.append(reaction)
+        else:
+            # if the reaction is not removed, remove the gene
+            # from its gpr
+            remover.visit(rule)
+            new_rule = ast2str(rule)
+            if new_rule != reaction.gene_reaction_rule:
+                reaction.gene_reaction_rule = new_rule
+    for gene in gene_set:
+        cobra_model.genes.remove(gene)
+    cobra_model.remove_reactions(target_reactions)

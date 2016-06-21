@@ -1,166 +1,430 @@
-from unittest import TestCase, TestLoader, TextTestRunner
+from unittest import TestCase, TestLoader, TextTestRunner, skipIf
 
 from warnings import warn
 import sys
-_module_function_dict = {'double_deletion': 'double_deletion',
-                          'single_deletion': 'single_deletion',
-                          'variability': 'flux_variability_analysis'}
+from os.path import join
+from json import load
+from contextlib import contextmanager
+import re
+
+from six import iteritems, StringIO
+
+try:
+    import numpy
+except:
+    numpy = None
+try:
+    import matplotlib
+except:
+    matplotlib = None
+try:
+    import pandas
+except:
+    pandas = None
+
 if __name__ == "__main__":
     sys.path.insert(0, "../..")
-    from cobra.test import create_test_model
+    from cobra.test import create_test_model, data_directory
     from cobra import Model, Reaction, Metabolite
     from cobra.manipulation import initialize_growth_medium
-    from cobra.solvers import solver_dict
-    from cobra.manipulation import modify
-    from cobra.flux_analysis.parsimonious import optimize_minimal_flux
-    for the_module, the_function in _module_function_dict.iteritems():
-        try:
-            exec('from cobra.flux_analysis.%s import %s'%(the_module, the_function))
-        except Exception, e:
-            _module_function_dict[the_module] = False
-            warn("%s test will not work with your current configuration: %s"%(the_function, e))
-
+    from cobra.solvers import solver_dict, get_solver_name
+    from cobra.flux_analysis import *
     sys.path.pop(0)
 else:
-    from . import create_test_model
+    from . import create_test_model, data_directory
     from .. import Model, Reaction, Metabolite
     from ..manipulation import initialize_growth_medium
-    from ..solvers import solver_dict
-    from ..manipulation import modify
-    from ..flux_analysis.parsimonious import optimize_minimal_flux
-    for the_module, the_function in _module_function_dict.iteritems():
-        try:
-            exec('from ..flux_analysis.%s import %s'%(the_module, the_function))
-        except Exception, e:
-            _module_function_dict[the_module] = False
-            warn("%s test will not work with your current configuration: %s"%(the_function, e))
-   
+    from ..solvers import solver_dict, get_solver_name
+    from ..flux_analysis import *
+
+
+@contextmanager
+def captured_output():
+    """ A context manager to test the IO summary methods """
+    new_out, new_err = StringIO(), StringIO()
+    old_out, old_err = sys.stdout, sys.stderr
+    try:
+        sys.stdout, sys.stderr = new_out, new_err
+        yield sys.stdout, sys.stderr
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
 
 
 class TestCobraFluxAnalysis(TestCase):
-    """Test the simulation functions in cobra.flux_analysis
+    """Test the simulation functions in cobra.flux_analysis"""
 
-
-
-    """
     def setUp(self):
-        self.model = create_test_model()
+        pass
 
     def test_pFBA(self):
-        model = self.model
+        model = create_test_model("textbook")
         for solver in solver_dict:
             optimize_minimal_flux(model, solver=solver)
-            self.assertAlmostEqual(model.solution.f, 0.3800, places=3)
-            self.assertAlmostEqual(sum(model.solution.x), 343.021, places=3)
-            self.assertGreater(min(model.solution.x), -1e-7)
+            abs_x = [abs(i) for i in model.solution.x]
+            self.assertEqual(model.solution.status, "optimal")
+            self.assertAlmostEqual(model.solution.f, 0.8739, places=3)
+            self.assertAlmostEqual(sum(abs_x), 518.4221, places=3)
 
-    def test_modify_reversible(self):
-        model1 = self.model
-        model1.optimize()
-        model2 = create_test_model()
-        modify.convert_to_irreversible(model2)
-        model2.optimize()
-        self.assertAlmostEqual(model1.solution.f, model2.solution.f, places=3)
-        modify.revert_to_reversible(model2)
-        model2.optimize()
-        self.assertAlmostEqual(model1.solution.f, model2.solution.f, places=3)
+            # Test desired_objective_value
+            desired_objective = 0.8
+            optimize_minimal_flux(model, solver=solver,
+                                  desired_objective_value=desired_objective)
+            abs_x = [abs(i) for i in model.solution.x]
+            self.assertEqual(model.solution.status, "optimal")
+            self.assertAlmostEqual(model.solution.f, desired_objective,
+                                   places=3)
+            self.assertAlmostEqual(sum(abs_x), 476.1594, places=3)
 
+            # Test fraction_of_optimum
+            optimize_minimal_flux(model, solver=solver,
+                                  fraction_of_optimum=0.95)
+            abs_x = [abs(i) for i in model.solution.x]
+            self.assertEqual(model.solution.status, "optimal")
+            self.assertAlmostEqual(model.solution.f, 0.95*0.8739, places=3)
+            self.assertAlmostEqual(sum(abs_x), 493.4400, places=3)
 
-    if _module_function_dict['single_deletion']:
-        def test_single_deletion(self):
+            # Make sure the model works for non-unity objective values
+            model.reactions.Biomass_Ecoli_core.objective_coefficient = 2
+            optimize_minimal_flux(model, solver=solver)
+            self.assertAlmostEqual(model.solution.f, 2*0.8739, places=3)
+            model.reactions.Biomass_Ecoli_core.objective_coefficient = 1
 
-            cobra_model = self.model
-            initialize_growth_medium(cobra_model, 'LB')
+            # Test some erroneous inputs -- multiple objectives
+            model.reactions.ATPM.objective_coefficient = 1
+            with self.assertRaises(ValueError):
+                optimize_minimal_flux(model, solver=solver)
+            model.reactions.ATPM.objective_coefficient = 0
 
-            #Expected growth rates for the salmonella model with deletions in LB medium
-            the_loci =  ['STM4081', 'STM0247', 'STM3867', 'STM2952']
-            the_genes = tpiA, metN, atpA, eno = map(cobra_model.genes.get_by_id, the_loci)
-            id_to_name = dict([(x.id, x.name) for x in the_genes])
-            growth_dict = {'fba':{tpiA.id:2.41, metN.id:2.44, atpA.id:1.87, eno.id:1.81},
-                           'moma':{ tpiA.id:1.62, metN.id:2.4, atpA.id:1.40, eno.id:0.33}}
+            # Minimization of objective
+            with self.assertRaises(ValueError):
+                optimize_minimal_flux(model, solver=solver,
+                                      objective_sense='minimize')
 
-            #MOMA requires cplex or gurobi
-            if 'cplex' not in solver_dict and 'gurobi' not in solver_dict:
-                growth_dict.pop('moma')
-            for method, the_growth_rates in growth_dict.items():
-                element_list = the_growth_rates.keys()
-                rates, statuses, problems = single_deletion(cobra_model,
-                                                            element_list=element_list,
-                                                            method=method)
+            # Infeasible solution
+            atpm = float(model.reactions.ATPM.lower_bound)
+            model.reactions.ATPM.lower_bound = 500
+            with self.assertRaises(ValueError):
+                optimize_minimal_flux(model, solver=solver)
+            model.reactions.ATPM.lower_bound = atpm
 
-                for the_gene in element_list:
-                    self.assertEqual(statuses[the_gene], 'optimal')
-                    self.assertAlmostEqual(rates[the_gene], the_growth_rates[the_gene],
-                                           places=2)
-            
+    def test_single_gene_deletion_fba(self):
+        cobra_model = create_test_model("textbook")
+        # expected knockouts for textbook model
+        growth_dict = {"b0008": 0.87, "b0114": 0.80, "b0116": 0.78,
+                       "b2276": 0.21, "b1779": 0.00}
 
-    if _module_function_dict['double_deletion']:
-        def test_double_deletion(self):
-            """
-            """
-            from os import name as __name
-            if __name == 'java':
-                warn("cobra.test.flux_analysis.test_double_deletion doesn't yet work with java")
-                return
-            cobra_model = self.model
-            #turn into a double deletion unit test
-            the_problem='return'
-            initialize_growth_medium(cobra_model, 'LB')
-            #Expected growth rates for the salmonella model with deletions in LB medium
-            the_loci =  ['STM4081', 'STM0247', 'STM3867', 'STM2952']
-            the_genes = tpiA, metN, atpA, eno = map(cobra_model.genes.get_by_id, the_loci)
-            growth_dict = {}
-            growth_list = [[2.41, 2.389, 1.775, 1.81],
-                           [2.389, 2.437, 1.86, 1.79],
-                           [1.775, 1.86, 1.87, 1.3269],
-                           [1.81, 1.79, 1.3269, 1.81]]
-            for the_gene, the_rates in zip(the_genes, growth_list):
-                growth_dict[the_gene] = dict(zip(the_genes, the_rates))
+        rates, statuses = single_gene_deletion(cobra_model,
+                                               gene_list=growth_dict.keys(),
+                                               method="fba")
+        for gene, expected_value in iteritems(growth_dict):
+            self.assertEqual(statuses[gene], 'optimal')
+            self.assertAlmostEqual(rates[gene], expected_value, places=2)
 
+    def test_single_gene_deletion_moma(self):
+        # MOMA requires a QP solver
+        try:
+            get_solver_name(qp=True)
+        except:
+            self.skipTest("no qp support")
 
-            the_solution = double_deletion(cobra_model, element_list_1=the_genes,
-                                           element_list_2=the_genes,
-                                           the_problem=the_problem)
-            #Potential problem if the data object doesn't have a tolist function
-            s_data = the_solution['data'].tolist()
-            s_x = the_solution['x']
-            s_y = the_solution['y']
-            for gene_x, rates_x in zip(s_x, s_data):
-                for gene_y, the_rate in zip(s_y, rates_x):
-                    self.assertAlmostEqual(growth_dict[gene_x][gene_y], the_rate,
-                                           places=2)
+        cobra_model = create_test_model("textbook")
+        # expected knockouts for textbook model
+        growth_dict = {"b0008": 0.87, "b0114": 0.71, "b0116": 0.56,
+                       "b2276": 0.11, "b1779": 0.00}
 
-    if _module_function_dict['variability']:
-        def test_flux_variability(self):
-            """
+        rates, statuses = single_gene_deletion(cobra_model,
+                                               gene_list=growth_dict.keys(),
+                                               method="moma")
+        for gene, expected_value in iteritems(growth_dict):
+            self.assertEqual(statuses[gene], 'optimal')
+            self.assertAlmostEqual(rates[gene], expected_value, places=2)
 
-            """
-            fva_results = {'5DGLCNtex': {'minimum': -1.9748300208638403e-05, 'maximum': 0.0}, 'ABTA': {'minimum': 0.0, 'maximum': 0.00014811225541408996}, '5DOAN': {'minimum': 0.0, 'maximum': 3.2227507421302166e-06}, 'A5PISO': {'minimum': 0.006920856282000001, 'maximum': 0.006922717378372606}, 'AACPS1': {'minimum': 0.0, 'maximum': 3.7028063376249126e-05}, 'AACPS2': {'minimum': 0.0, 'maximum': 3.7028063733878864e-05}, 'ACALDtex': {'minimum': -0.00011848980305159615, 'maximum': 0.0}, 'AACPS3': {'minimum': 0.0, 'maximum': 3.702806337623859e-05}, 'AACPS4': {'minimum': 0.0, 'maximum': 3.702806373387888e-05}, 'ABUTD': {'minimum': 0.0, 'maximum': 0.00014811225541406058}, 'AACPS5': {'minimum': 0.0, 'maximum': 2.8211857518389774e-05}, 'AACPS6': {'minimum': 0.0, 'maximum': 2.821185753295664e-05}, 'AACPS7': {'minimum': 0.0, 'maximum': 3.702806368868028e-05}, 'AACPS8': {'minimum': 0.0, 'maximum': 3.702806338788376e-05}, 'AACPS9': {'minimum': 0.0, 'maximum': 3.702806309933293e-05}, 'AACTOOR': {'minimum': 0.0, 'maximum': 1.5388286124597477e-05}, 'ABUTt2pp': {'minimum': 0.0, 'maximum': 0.0}, '3OAS140': {'minimum': 0.5041754136687804, 'maximum': 0.5042009621703677}, '3OAS141': {'minimum': 0.037484893950000084, 'maximum': 0.03750284695065363}, '3OAS160': {'minimum': 0.41767086529953557, 'maximum': 0.41769641380045963}, '3OAS161': {'minimum': 0.03748489395, 'maximum': 0.03750284695060761}, '3OAS180': {'minimum': 0.01069201669939239, 'maximum': 0.010717565200387778}, '3OAS181': {'minimum': 0.01606495455, 'maximum': 0.01608290755044158}, 'ABUTtex': {'minimum': 0.0, 'maximum': 0.0}, '3OAS60': {'minimum': 0.5439852127139995, 'maximum': 0.5439896193596934}, '3OAS80': {'minimum': 0.5439852127140001, 'maximum': 0.5439896193596934}, 'AAMYL': {'minimum': 0.0, 'maximum': 0.0}, '3PEPTabcpp': {'minimum': 0.0, 'maximum': 5.808323730923103e-06}, '3PEPTtex': {'minimum': -3.4245609402880297e-06, 'maximum': 0.0}, '3UMPtex': {'minimum': 0.0, 'maximum': 0.0}, '4HOXPACDtex': {'minimum': 0.0, 'maximum': 0.0}, 'ACACtex': {'minimum': 0.0, 'maximum': 0.0}, '4PCP': {'minimum': 0.0, 'maximum': 6.171343917391756e-06}, '4PCPpp': {'minimum': 0.0, 'maximum': 5.58914186256664e-06}, 'AAMYLpp': {'minimum': 0.0, 'maximum': 0.0}, '4PEPTabcpp': {'minimum': 0.0, 'maximum': 5.696625084349692e-06}, '4PEPTtex': {'minimum': -3.2198316806921494e-06, 'maximum': 0.0}, '5DGLCNR': {'minimum': -2.1942555793285538e-05, 'maximum': 0.0}, '5DGLCNt2rpp': {'minimum': -1.9748300208638403e-05, 'maximum': 0.0}, 'ACALD': {'minimum': 3.356574143593833, 'maximum': 7.4971939913624155}}
+    def test_single_reaction_deletion(self):
+        cobra_model = create_test_model("textbook")
+        expected_results = {'FBA': 0.70404, 'FBP': 0.87392, 'CS': 0,
+                            'FUM': 0.81430, 'GAPD': 0, 'GLUDy': 0.85139}
 
+        results, status = single_reaction_deletion(
+            cobra_model, reaction_list=expected_results.keys())
+        self.assertEqual(len(results), 6)
+        self.assertEqual(len(status), 6)
+        for status_value in status.values():
+            self.assertEqual(status_value, "optimal")
+        for reaction, value in results.items():
+            self.assertAlmostEqual(value, expected_results[reaction], 5)
 
-            cobra_model = self.model
-            the_problem='return'
-            initialize_growth_medium(cobra_model, 'LB')
-            the_problem = cobra_model.optimize(the_problem=the_problem)
-            fva_out = flux_variability_analysis(cobra_model,
-                                                the_problem=the_problem,
-                                                the_reactions=cobra_model.reactions[100:140])
+    def compare_matrices(self, matrix1, matrix2, places=3):
+        nrows = len(matrix1)
+        ncols = len(matrix1[0])
+        self.assertEqual(nrows, len(matrix2))
+        self.assertEqual(ncols, len(matrix2[0]))
+        for i in range(nrows):
+            for j in range(ncols):
+                self.assertAlmostEqual(matrix1[i][j], matrix2[i][j],
+                                       places=places)
 
-            for the_reaction, the_range in fva_out.iteritems():
-                for k, v in the_range.iteritems():
-                    self.assertAlmostEqual(fva_results[the_reaction][k], v, places=3)
+    @skipIf(numpy is None, "double deletions require numpy")
+    def test_double_gene_deletion(self):
+        cobra_model = create_test_model("textbook")
+        genes = ["b0726", "b4025", "b0724", "b0720",
+                 "b2935", "b2935", "b1276", "b1241"]
+        growth_list = [
+            [0.858, 0.857, 0.814, 0.000, 0.858, 0.858, 0.858, 0.858],
+            [0.857, 0.863, 0.739, 0.000, 0.863, 0.863, 0.863, 0.863],
+            [0.814, 0.739, 0.814, 0.000, 0.814, 0.814, 0.814, 0.814],
+            [0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000],
+            [0.858, 0.863, 0.814, 0.000, 0.874, 0.874, 0.874, 0.874],
+            [0.858, 0.863, 0.814, 0.000, 0.874, 0.874, 0.874, 0.874],
+            [0.858, 0.863, 0.814, 0.000, 0.874, 0.874, 0.874, 0.874],
+            [0.858, 0.863, 0.814, 0.000, 0.874, 0.874, 0.874, 0.874]]
+        solution = double_gene_deletion(cobra_model, gene_list1=genes)
+        self.assertEqual(solution["x"], genes)
+        self.assertEqual(solution["y"], genes)
+        self.compare_matrices(growth_list, solution["data"])
+        # test when lists differ slightly
+        solution = double_gene_deletion(cobra_model, gene_list1=genes[:-1],
+                                        gene_list2=genes,
+                                        number_of_processes=1)
+        self.assertEqual(solution["x"], genes[:-1])
+        self.assertEqual(solution["y"], genes)
+        self.compare_matrices(growth_list[:-1], solution["data"])
 
-  
+    @skipIf(numpy is None, "double deletions require numpy")
+    def test_double_reaction_deletion(self):
+        cobra_model = create_test_model("textbook")
+        reactions = ['FBA', 'ATPS4r', 'ENO', 'FRUpts2']
+        growth_list = [[0.704, 0.135, 0.000, 0.704],
+                       [0.135, 0.374, 0.000, 0.374],
+                       [0.000, 0.000, 0.000, 0.000],
+                       [0.704, 0.374, 0.000, 0.874]]
+
+        solution = double_reaction_deletion(cobra_model,
+                                            reaction_list1=reactions,
+                                            number_of_processes=1)
+        self.assertEqual(solution["x"], reactions)
+        self.assertEqual(solution["y"], reactions)
+        self.compare_matrices(growth_list, solution["data"])
+
+    def test_flux_variability(self):
+        with open(join(data_directory, "textbook_fva.json"), "r") as infile:
+            fva_results = load(infile)
+
+        infeasible_model = create_test_model("textbook")
+        infeasible_model.reactions.get_by_id("EX_glc__D_e").lower_bound = 0
+        for solver in solver_dict:
+            # esolver is really slow
+            if solver == "esolver":
+                continue
+            cobra_model = create_test_model("textbook")
+            fva_out = flux_variability_analysis(
+                cobra_model, solver=solver,
+                reaction_list=cobra_model.reactions[1::3])
+            for name, result in iteritems(fva_out):
+                for k, v in iteritems(result):
+                    self.assertAlmostEqual(fva_results[name][k], v, places=5)
+
+            # ensure that an infeasible model does not run FVA
+            self.assertRaises(ValueError, flux_variability_analysis,
+                              infeasible_model, solver=solver)
+
+    def test_find_blocked_reactions(self):
+        m = create_test_model("textbook")
+        result = find_blocked_reactions(m, m.reactions[40:46])
+        self.assertEqual(result, ['FRUpts2'])
+
+        result = find_blocked_reactions(m, m.reactions[42:48])
+        self.assertEqual(set(result), {'FUMt2_2', 'FRUpts2'})
+
+        result = find_blocked_reactions(m, m.reactions[30:50],
+                                        open_exchanges=True)
+        self.assertEqual(result, [])
+
+    def test_loopless(self):
+        try:
+            solver = get_solver_name(mip=True)
+        except:
+            self.skipTest("no MILP solver found")
+        test_model = Model()
+        test_model.add_metabolites(Metabolite("A"))
+        test_model.add_metabolites(Metabolite("B"))
+        test_model.add_metabolites(Metabolite("C"))
+        EX_A = Reaction("EX_A")
+        EX_A.add_metabolites({test_model.metabolites.A: 1})
+        DM_C = Reaction("DM_C")
+        DM_C.add_metabolites({test_model.metabolites.C: -1})
+        v1 = Reaction("v1")
+        v1.add_metabolites({test_model.metabolites.A: -1,
+                            test_model.metabolites.B: 1})
+        v2 = Reaction("v2")
+        v2.add_metabolites({test_model.metabolites.B: -1,
+                            test_model.metabolites.C: 1})
+        v3 = Reaction("v3")
+        v3.add_metabolites({test_model.metabolites.C: -1,
+                            test_model.metabolites.A: 1})
+        DM_C.objective_coefficient = 1
+        test_model.add_reactions([EX_A, DM_C, v1, v2, v3])
+        feasible_sol = construct_loopless_model(test_model).optimize()
+        v3.lower_bound = 1
+        infeasible_sol = construct_loopless_model(test_model).optimize()
+        self.assertEqual(feasible_sol.status, "optimal")
+        self.assertEqual(infeasible_sol.status, "infeasible")
+
+    def test_gapfilling(self):
+        try:
+            solver = get_solver_name(mip=True)
+        except:
+            self.skipTest("no MILP solver found")
+        m = Model()
+        m.add_metabolites(map(Metabolite, ["a", "b", "c"]))
+        r = Reaction("EX_A")
+        m.add_reaction(r)
+        r.add_metabolites({m.metabolites.a: 1})
+        r = Reaction("r1")
+        m.add_reaction(r)
+        r.add_metabolites({m.metabolites.b: -1, m.metabolites.c: 1})
+        r = Reaction("DM_C")
+        m.add_reaction(r)
+        r.add_metabolites({m.metabolites.c: -1})
+        r.objective_coefficient = 1
+
+        U = Model()
+        r = Reaction("a2b")
+        U.add_reaction(r)
+        r.build_reaction_from_string("a --> b", verbose=False)
+        r = Reaction("a2d")
+        U.add_reaction(r)
+        r.build_reaction_from_string("a --> d", verbose=False)
+
+        # GrowMatch
+        result = gapfilling.growMatch(m, U)[0]
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].id, "a2b")
+        # SMILEY
+        result = gapfilling.SMILEY(m, "b", U)[0]
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].id, "a2b")
+
+        # 2 rounds of GrowMatch with exchange reactions
+        result = gapfilling.growMatch(m, None, ex_rxns=True, iterations=2)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(len(result[0]), 1)
+        self.assertEqual(len(result[1]), 1)
+        self.assertEqual({i[0].id for i in result},
+                         {"SMILEY_EX_b", "SMILEY_EX_c"})
+
+    @skipIf(numpy is None, "phase plane requires numpy")
+    def test_phenotype_phase_plane(self):
+        model = create_test_model("textbook")
+        data = calculate_phenotype_phase_plane(
+            model, "EX_glc__D_e", "EX_o2_e",
+            reaction1_npoints=20, reaction2_npoints=20)
+        self.assertEqual(data.growth_rates.shape, (20, 20))
+        self.assertAlmostEqual(data.growth_rates.max(), 1.20898, places=4)
+        self.assertAlmostEqual(abs(data.growth_rates[0, :]).max(), 0, places=4)
+        if matplotlib is None:
+            self.skipTest("can't test plots without matplotlib")
+        data.plot()
+
+    def check_entries(self, out, desired_entries):
+        """ensure each entry in desired_entries appears in output"""
+        output = out.getvalue().strip()
+        output_set = set((re.sub('\s', '', l) for l in output.splitlines()))
+
+        for item in desired_entries:
+            self.assertIn(re.sub('\s', '', item), output_set)
+
+    @skipIf(pandas is None, "summary methods require pandas")
+    def test_summary_methods(self):
+
+        # Test model summary methods
+        model = create_test_model("textbook")
+        model.optimize()
+        desired_entries = [
+            u'glc__D_e     -9.76 \u00B1 0.24'
+            u'co2_e       21.81 \u00B1 2.86',
+            u'nh4_e        -4.84 \u00B1 0.32'
+            u'h_e         19.51 \u00B1 2.86',
+            u'pi_e         -3.13 \u00B1 0.08'
+            u'for_e        2.86 \u00B1 2.86',
+            u'ac_e         0.95 \u00B1 0.95',
+            u'acald_e      0.64 \u00B1 0.64',
+            u'pyr_e        0.64 \u00B1 0.64',
+            u'etoh_e       0.55 \u00B1 0.55',
+            u'lac__D_e     0.54 \u00B1 0.54',
+            u'succ_e       0.42 \u00B1 0.42',
+            u'akg_e        0.36 \u00B1 0.36',
+            u'glu__L_e     0.32 \u00B1 0.32'
+        ]
+        for solver in solver_dict:
+            with captured_output() as (out, err):
+                model.summary(fva=0.95, solver=solver)
+            self.check_entries(out, desired_entries)
+
+        # test non-fva version (these should be fixed for textbook model
+        desired_entries = [
+            "o2_e       -21.80",
+            "glc__D_e   -10.00",
+            "nh4_e       -4.77",
+            "pi_e        -3.21",
+            "h2o_e    29.18",
+            "co2_e    22.81",
+            "h_e      17.53",
+            "Biomass_Ecoli_core    0.874"
+        ]
+        # Need to use a different method here because
+        # there are multiple entries per line.
+        with captured_output() as (out, err):
+            model.summary()
+        s = out.getvalue()
+        for i in desired_entries:
+            self.assertIn(i, s)
+
+        # Test metabolite summary methods
+        desired_entries = [
+            'PRODUCING REACTIONS -- Ubiquinone-8',
+            '-----------------------------------',
+            '%      FLUX   RXN ID'
+            'REACTION',
+            '100.0%     44    CYTBD'
+            '2.0 h_c + 0.5 o2_c + q8h2_c --> h2o_c + 2.0 h_e +...',
+            'CONSUMING REACTIONS -- Ubiquinone-8',
+            '-----------------------------------',
+            '88.4%    -39   NADH16'
+            '4.0 h_c + nadh_c + q8_c --> 3.0 h_e + nad_c + q8h2_c',
+            '11.6%   -5.1    SUCDi'
+            'q8_c + succ_c --> fum_c + q8h2_c',
+        ]
+        with captured_output() as (out, err):
+            model.metabolites.q8_c.summary()
+        self.check_entries(out, desired_entries)
+
+        desired_entries = [
+            u'PRODUCING REACTIONS -- D-Fructose 1,6-bisphosphate',
+            u'--------------------------------------------------',
+            u'  %            FLUX   RXN ID'
+            u'REACTION',
+            u'100.0%  7.71 \u00B1 1.54      PFK'
+            u'atp_c + f6p_c --> adp_c + fdp_c + h_c',
+            u'CONSUMING REACTIONS -- D-Fructose 1,6-bisphosphate',
+            u'--------------------------------------------------',
+            u'  %            FLUX   RXN ID'
+            u'REACTION',
+            u'100.0%  7.54 \u00B1 1.37      FBA'
+            u'fdp_c <=> dhap_c + g3p_c',
+        ]
+        for solver in solver_dict:
+            with captured_output() as (out, err):
+                model.metabolites.fdp_c.summary(fva=0.99, solver=solver)
+            self.check_entries(out, desired_entries)
 
 
 # make a test suite to run all of the tests
 loader = TestLoader()
 suite = loader.loadTestsFromModule(sys.modules[__name__])
 
+
 def test_all():
     TextTestRunner(verbosity=2).run(suite)
 
 if __name__ == "__main__":
     test_all()
-
-

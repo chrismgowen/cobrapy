@@ -1,78 +1,59 @@
-from __future__ import with_statement, absolute_import
-import sys
-from os import name as __name
-available_tests = ['unit_tests', 'solvers', 'flux_analysis']
-#if not using jython then add the tests that don't currently run through jython
-## if __name != 'java':
-##      available_tests += ['flux_analysis']
+from __future__ import absolute_import
+from os.path import join, abspath, dirname
+import unittest as _unittest
 
-del __name
+try:
+    from cPickle import load as _load
+except:
+    from pickle import load as _load
 
-from os.path import abspath as __abspath
-from os.path import join as __join
-from os.path import split as __split
-from os.path import sep as __sep
+from ..io import read_sbml_model
 
-cobra_directory = __abspath(__join(__split(__abspath(__file__))[0], ".."))
-cobra_location = __abspath(__join(cobra_directory, ".."))
-data_directory = __join(__split(__abspath(__file__))[0], "data")
-if not data_directory.endswith(__sep):
-    data_directory += __sep
 
-salmonella_sbml = __join(data_directory, "salmonella.xml")
-salmonella_pickle = __join(data_directory, "salmonella.pickle")
-salmonella_reaction_p_values_pickle = __join(data_directory, "salmonella_reaction_p_values.pickle")
-ecoli_sbml = __join(data_directory, "iJO1366.xml")
-ecoli_pickle = __join(data_directory, "iJO1366.pickle")
-ecoli_mat = __join(data_directory, "iJO1366.mat")
-yersinia_sbml = __join(data_directory, 'Yersinia_pestis_CO92_iPC815.xml')
-yersinia_pickle = __join(data_directory, 'Yersinia_pestis_CO92_iPC815.pickle')
+available_tests = ['unit_tests', 'solvers', 'flux_analysis', 'io_tests',
+                   'design', 'manipulation']
 
-__test_pickles = {'Salmonella_enterica': salmonella_pickle,
-                  'Escherichia_coli': ecoli_pickle,
-                  'Yersinia_pestis': yersinia_pickle}
-__test_xml = {'Salmonella_enterica': salmonella_sbml,
-              'Escherichia_coli': ecoli_sbml,
-              'Yersinia_pestis': yersinia_sbml}
-del __abspath, __join, __split, __sep
 
-def create_test_model(test_pickle=salmonella_pickle):
-    """Returns a cobra model for testing.  The default model is the up to date
-    version of the Salmonella enterica Typhimurium LT2 model published in
-    Thiele et al. 2011 BMC Sys Bio 5:8
+cobra_directory = abspath(join(dirname(abspath(__file__)), ".."))
+cobra_location = abspath(join(cobra_directory, ".."))
+data_directory = join(cobra_directory, "test", "data", "")
 
-    test_pickle: The complete file name of a pickled cobra.Model or SBML XML
-    file to be read.  We currently provide Salmonella enterica Typhimurium
-    and Escherichia coli models whose paths are stored in cobra.test.salmonella_pickle
-    and cobra.test.ecoli_pickle, respectively.  The ecoli model is a variant of the
-    model published in Orth et al. 2011 Mol Syst Biol 7:535
+salmonella_sbml = join(data_directory, "salmonella.xml")
+salmonella_pickle = join(data_directory, "salmonella.pickle")
+
+ecoli_sbml = join(data_directory, "iJO1366.xml")
+textbook_sbml = join(data_directory, "textbook.xml.gz")
+mini_sbml = join(data_directory, "mini_fbc2.xml")
+
+del abspath, join, dirname
+
+
+def create_test_model(model_name="salmonella"):
+    """Returns a cobra model for testing
+
+    model_name: str
+        One of 'ecoli', 'textbook', or 'salmonella', or the
+        path to a pickled cobra.Model
 
     """
-    from os import name as __name
-    try:
-        from cPickle import load
-    except:
-        from pickle import load
 
-    try: 
-        with open(test_pickle, "rb") as infile:
-            model = load(infile)
-    except:
-        #if the pickle can't be loaded then load the sbml xml
-        from warnings import warn
-        warn("Couldn't load %s.  Loading the default model %s instead"%(test_pickle,
-                                                                        salmonella_sbml))
-        sys.path.insert(0, cobra_location)
-        from cobra.io import read_sbml_model
-        model = read_sbml_model(salmonella_sbml)
-        sys.path.pop(0)
-    return model
+    if model_name == "ecoli":
+        return read_sbml_model(ecoli_sbml)
+    elif model_name == "textbook":
+        return read_sbml_model(textbook_sbml)
+    elif model_name == "mini":
+        return read_sbml_model(mini_sbml)
+
+    if model_name == "salmonella":
+        model_name = salmonella_pickle
+    with open(model_name, "rb") as infile:
+        return _load(infile)
+
 
 def create_test_suite():
     """create a unittest.TestSuite with available tests"""
-    from unittest import TestLoader, TestSuite
-    loader = TestLoader()
-    suite = TestSuite()
+    loader = _unittest.TestLoader()
+    suite = _unittest.TestSuite()
     for test_name in available_tests:
         exec("from . import " + test_name)
         suite.addTests(loader.loadTestsFromModule(eval(test_name)))
@@ -80,7 +61,10 @@ def create_test_suite():
 
 suite = create_test_suite()
 
+
 def test_all():
     """###running unit tests on cobra py###"""
-    from unittest import TextTestRunner
-    TextTestRunner(verbosity=2).run(create_test_suite())
+    status = not _unittest.TextTestRunner(verbosity=2).run(
+        create_test_suite()
+    ).wasSuccessful()
+    return status

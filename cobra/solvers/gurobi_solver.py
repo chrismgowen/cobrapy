@@ -1,330 +1,286 @@
-##cobra.solvers.gurobi_solver
-#Interface to the gurobi 5.0.1 python and java solvers
-#QPs are not yet supported on java
+# Interface to gurobipy
+
 from warnings import warn
-from os import name as __name
-from copy import deepcopy
-###solver specific parameters
-from .parameters import status_dict, variable_kind_dict, \
-     sense_dict, parameter_mappings, parameter_defaults, \
-     objective_senses, default_objective_sense
+from multiprocessing import Process
+import platform
+try:
+    # Import izip for python versions < 3.x
+    from itertools import izip as zip
+except ImportError:
+    pass
+
+
+def test_import():
+    """Sometimes trying to import gurobipy can segfault. To prevent this from
+    crashing everything, ensure it can be imported in a separate process."""
+    try:
+        import gurobipy
+    except ImportError:
+        pass
+
+if platform.system() != "Windows":
+    # https://github.com/opencobra/cobrapy/issues/207
+    p = Process(target=test_import)
+    p.start()
+    p.join()
+    if p.exitcode != 0:
+        raise RuntimeError("importing gurobi causes a crash (exitcode %d)" %
+                           p.exitcode)
+
+from gurobipy import Model, LinExpr, GRB, QuadExpr
 
 from ..core.Solution import Solution
-from ..flux_analysis.objective import update_objective
-from time import time
+
+from six import string_types, iteritems
+
+try:
+    from sympy import Basic, Number
+except:
+    class Basic:
+        pass
+    Number = Basic
+
+
+def _float(value):
+    if isinstance(value, Basic) and not isinstance(value, Number):
+        return 0.
+    else:
+        return float(value)
+
 solver_name = 'gurobi'
-objective_senses = objective_senses[solver_name]
-parameter_mappings = parameter_mappings[solver_name]
-parameter_defaults = parameter_defaults[solver_name]
-#Functions that are different for java implementation of a solver
-if __name == 'java':
-    ## from jarray import array as j_array
-    ## def array(x, variable_type='d'):
-    ##     return j_array(x, variable_type)
+_SUPPORTS_MILP = True
 
-    from gurobi import GRB
-    variable_kind_dict = eval(variable_kind_dict[solver_name])
-    status_dict = eval(status_dict[solver_name])
 
-    from gurobi import GRBModel, GRBEnv
-    from gurobi import GRBLinExpr
-    from gurobi import GRBQuadExpr as QuadExpr
-    __solver_class = GRBModel
-    #TODO: Create a pythonesqe class similar to in glpk_solver
-    def Model(name=''):
-        grb_environment = GRBEnv(name)
-        tmp_model = GRBModel(grb_environment)
-        return tmp_model
-    def LinExpr(coefficients, variables):
-        coefficients, variables = map(list, [coefficients, variables])
-        tmp_expression = GRBLinExpr()
-        tmp_expression.addTerms(coefficients, variables)
-        return tmp_expression
+# set solver-specific parameters
+parameter_defaults = {'objective_sense': 'maximize',
+                      'tolerance_optimality': 1e-6,
+                      'tolerance_feasibility': 1e-6,
+                      'tolerance_integer': 1e-9,
+                      # This is primal simplex, default is -1 (automatic)
+                      'lp_method': 0,
+                      'verbose': False,
+                      'log_file': ''}
+parameter_mappings = {'log_file': 'LogFile',
+                      'lp_method': 'Method',
+                      'threads': 'Threads',
+                      'objective_sense': 'ModelSense',
+                      'output_verbosity': 'OutputFlag',
+                      'verbose': 'OutputFlag',
+                      'quadratic_precision': 'Quad',
+                      'time_limit': 'TimeLimit',
+                      'tolerance_feasibility': 'FeasibilityTol',
+                      'tolerance_markowitz': 'MarkowitzTol',
+                      'tolerance_optimality': 'OptimalityTol',
+                      'iteration_limit': 'IterationLimit',
+                      'tolerance_barrier': 'BarConvTol',
+                      'tolerance_integer': 'IntFeasTol',
+                      'MIP_gap_abs': 'MIPGapAbs',
+                      'MIP_gap': 'MIPGap'}
+# http://www.gurobi.com/documentation/5./6/reference-manual/method
+METHODS = {"auto": -1, "primal": 0, "dual": 1, "barrier": 2,
+           "concurrent": 3, "deterministic concurrent": 4}
+variable_kind_dict = {'continuous': GRB.CONTINUOUS, 'integer': GRB.INTEGER}
+sense_dict = {'E': GRB.EQUAL, 'L': GRB.LESS_EQUAL, 'G': GRB.GREATER_EQUAL}
+objective_senses = {'maximize': GRB.MAXIMIZE, 'minimize': GRB.MINIMIZE}
+status_dict = {GRB.OPTIMAL: 'optimal', GRB.INFEASIBLE: 'infeasible',
+               GRB.UNBOUNDED: 'unbounded', GRB.TIME_LIMIT: 'time_limit'}
 
-    def get_status(lp):
-        status = lp.get(GRB.IntAttr.Status)
-        if status in status_dict:
-            status = status_dict[status]
+
+def get_status(lp):
+    status = lp.status
+    if status in status_dict:
+        status = status_dict[status]
+    else:
+        status = 'failed'
+    return status
+
+
+def get_objective_value(lp):
+    return lp.ObjVal
+
+
+def format_solution(lp, cobra_model, **kwargs):
+    status = get_status(lp)
+    if status not in ('optimal', 'time_limit'):
+        the_solution = Solution(None, status=status)
+    else:
+        objective_value = lp.ObjVal
+        x = [v.X for v in lp.getVars()]
+        x_dict = {r.id: value for r, value in zip(cobra_model.reactions, x)}
+        if lp.isMIP:
+            y = y_dict = None  # MIP's don't have duals
         else:
-            status = 'failed'
-        return status
-
-    def set_parameter(lp, parameter_name, parameter_value):
-        """Sets model parameters and attributes.
-        
-        """
-        grb_environment = lp.getEnv()
-        try:
-            if hasattr(GRB.DoubleParam, parameter_name):
-                grb_environment.set(eval('GRB.DoubleParam.%s'%parameter_name),
-                                         parameter_value)
-            elif hasattr(GRB.IntParam, parameter_name):
-                grb_environment.set(eval('GRB.IntParam.%s'%parameter_name),
-                                         parameter_value)
-            elif hasattr(GRB.StringParam, parameter_name):
-                grb_environment.set(eval('GRB.StringParam.%s'%parameter_name),
-                                    parameter_value)
-            elif hasattr(GRB.IntAttr, parameter_name):
-                if parameter_name == 'ModelSense':
-                    parameter_value = objective_senses[parameter_value]
-                lp.set(eval('GRB.IntAttr.%s'%parameter_name),
-                                    parameter_value)
-            else:
-                warn("%s is not a DoubleParam, IntParam, StringParam, IntAttr"%parameter_name)
-                ## raise Exception("%s is not a DoubleParam, IntParam, StringParam, IntAttr"%parameter_name)
-        except Exception, e:
-            warn("%s %s didn't work %s"%(parameter_name, parameter_value, e))
-
-    def get_objective_value(lp):
-        return lp.get(GRB.DoubleAttr.ObjVal)
-
-    def format_solution(lp, cobra_model, **kwargs):
-        """
-        """
-        status = get_status(lp)
-        if status not in ('optimal', 'time_limit'):
-            the_solution = Solution(None, status=status)
-        else:
-            x_dict = dict(((v.get(GRB.StringAttr.VarName),
-                            v.get(GRB.DoubleAttr.X))
-                           for v in lp.getVars()))
-            x = [x_dict[v.id] for v in cobra_model.reactions]
-            objective_value = lp.get(GRB.DoubleAttr.ObjVal)
-            if lp.get(GRB.IntAttr.IsMIP) != 0:
-                y = y_dict = None #MIP's don't have duals
-            else:
-                y_dict = dict(((c.get(GRB.StringAttr.ConstrName), c.get(GRB.DoubleAttr.Pi))
-                              for c in lp.getConstrs()))
-                y = list([y_dict[v.id] for v in cobra_model.metabolites])
-            the_solution = Solution(objective_value, x=x, x_dict=x_dict, y=y,
-                                    y_dict=y_dict, status=status)
-        return(the_solution)
-
-    def update_problem(lp, cobra_model, **kwargs):
-        """A performance tunable method for updating a model problem file
-
-        lp: A gurobi problem object
-
-        cobra_model: the cobra.Model corresponding to 'lp'
-
-        """
-        #When reusing the basis only assume that the objective coefficients or bounds can change
-        try:
-            quadratic_component = kwargs['quadratic_component']
-            if quadratic_component is not None:
-                warn("update_problem does not yet take quadratic_component as a parameter")
-        except:
-            quadratic_component = None
-
-        if 'reuse_basis' in kwargs and not kwargs['reuse_basis']:
-            lp.reset()
-        for the_variable, the_reaction in zip(lp.getVars(),
-                                              cobra_model.reactions):
-            the_variable.set(GRB.DoubleAttr.LB, float(the_reaction.lower_bound))
-            the_variable.set(GRB.DoubleAttr.UB, float(the_reaction.upper_bound))
-            the_variable.set(GRB.DoubleAttr.Obj, float(the_reaction.objective_coefficient))
+            y = [c.Pi for c in lp.getConstrs()]
+            y_dict = {m.id: value for m, value
+                      in zip(cobra_model.metabolites, y)}
+        the_solution = Solution(objective_value, x=x, x_dict=x_dict, y=y,
+                                y_dict=y_dict, status=status)
+    return(the_solution)
 
 
-else:
-    ## from numpy import array
-    from gurobipy import Model, LinExpr, GRB, QuadExpr
-    variable_kind_dict = eval(variable_kind_dict[solver_name])
-    status_dict = eval(status_dict[solver_name])
-    __solver_class = Model
-    def get_status(lp):
-        status = lp.status
-        if status in status_dict:
-            status = status_dict[status]
-        else:
-            status = 'failed'
-        return status
-
-    def get_objective_value(lp):
-        return lp.ObjVal
-
-    def format_solution(lp, cobra_model, **kwargs):
-        status = get_status(lp)
-        if status not in ('optimal', 'time_limit'):
-            the_solution = Solution(None, status=status)
-        else:
-            objective_value = lp.ObjVal            
-            x_dict = dict(((v.VarName, v.X)
-                           for v in lp.getVars()))
-            x = [x_dict[v.id] for v in cobra_model.reactions]
-            if lp.isMIP:
-                y = y_dict = None #MIP's don't have duals
-            else:
-                y_dict = dict(((c.ConstrName, c.Pi)
-                              for c in lp.getConstrs()))
-                y = list([y_dict[v.id] for v in cobra_model.metabolites])
-            the_solution = Solution(objective_value, x=x, x_dict=x_dict, y=y,
-                                    y_dict=y_dict, status=status)
-        return(the_solution)
-
-    def set_parameter(lp, parameter_name, parameter_value):
-        if parameter_name == 'ModelSense':
-            lp.setAttr(parameter_name, objective_senses[parameter_value])
-        else:
-            lp.setParam(parameter_name, parameter_value)
-
-    def update_problem(lp, cobra_model, **kwargs):
-        """A performance tunable method for updating a model problem file
-
-        lp: A gurobi problem object
-
-        cobra_model: the cobra.Model corresponding to 'lp'
-
-        """
-        #When reusing the basis only assume that the objective coefficients or bounds can change
-        try:
-            quadratic_component = kwargs['quadratic_component']
-            if quadratic_component is not None:
-                warn("update_problem does not yet take quadratic_component as a parameter")
-        except:
-            quadratic_component = None
-
-        if 'copy_problem' in kwargs and kwargs['copy_problem']:
-            lp = lp.copy()
-        if 'reuse_basis' in kwargs and not kwargs['reuse_basis']:
-            lp.reset()
-        for the_variable, the_reaction in zip(lp.getVars(),
-                                              cobra_model.reactions):
-            the_variable.lb = float(the_reaction.lower_bound)
-            the_variable.ub = float(the_reaction.upper_bound)
-            the_variable.obj = float(the_reaction.objective_coefficient)
+def set_parameter(lp, parameter_name, parameter_value):
+    if parameter_name == 'ModelSense' or parameter_name == "objective_sense":
+        lp.setAttr('ModelSense', objective_senses[parameter_value])
+    elif parameter_name == 'reuse_basis' and not parameter_value:
+        lp.reset()
+    else:
+        parameter_name = parameter_mappings.get(parameter_name, parameter_name)
+        if parameter_name == "Method" and isinstance(parameter_value,
+                                                     string_types):
+            parameter_value = METHODS[parameter_value]
+        lp.setParam(parameter_name, parameter_value)
 
 
+def change_variable_bounds(lp, index, lower_bound, upper_bound):
+    variable = lp.getVarByName(str(index))
+    variable.lb = lower_bound
+    variable.ub = upper_bound
 
-###
-sense_dict = eval(sense_dict[solver_name])
-def create_problem(cobra_model,  **kwargs):
+
+def change_variable_objective(lp, index, objective):
+    variable = lp.getVarByName(str(index))
+    variable.obj = objective
+
+
+def change_coefficient(lp, met_index, rxn_index, value):
+    met = lp.getConstrByName(str(met_index))
+    rxn = lp.getVarByName(str(rxn_index))
+    lp.chgCoeff(met, rxn, value)
+
+
+def update_problem(lp, cobra_model, **kwargs):
+    """A performance tunable method for updating a model problem file
+
+    lp: A gurobi problem object
+
+    cobra_model: the cobra.Model corresponding to 'lp'
+
+    """
+    #When reusing the basis only assume that the objective coefficients or bounds can change
+    try:
+        quadratic_component = kwargs['quadratic_component']
+        if quadratic_component is not None:
+            warn("update_problem does not yet take quadratic_component as a parameter")
+    except:
+        quadratic_component = None
+
+    if 'copy_problem' in kwargs and kwargs['copy_problem']:
+        lp = lp.copy()
+    if 'reuse_basis' in kwargs and not kwargs['reuse_basis']:
+        lp.reset()
+    for the_variable, the_reaction in zip(lp.getVars(),
+                                          cobra_model.reactions):
+        the_variable.lb = float(the_reaction.lower_bound)
+        the_variable.ub = float(the_reaction.upper_bound)
+        the_variable.obj = float(the_reaction.objective_coefficient)
+
+
+def create_problem(cobra_model, quadratic_component=None, **kwargs):
     """Solver-specific method for constructing a solver problem from
     a cobra.Model.  This can be tuned for performance using kwargs
 
 
     """
     lp = Model("")
-    #Silence the solver
-    set_parameter(lp, 'OutputFlag', 0)
 
     the_parameters = parameter_defaults
     if kwargs:
-        the_parameters = deepcopy(parameter_defaults)
+        the_parameters = parameter_defaults.copy()
         the_parameters.update(kwargs)
 
-    [set_parameter(lp, parameter_mappings[k], v)
-         for k, v in the_parameters.iteritems() if k in parameter_mappings]
-    quadratic_component = the_parameters['quadratic_component']
-    objective_sense = objective_senses[the_parameters['objective_sense']]
+    # Set verbosity first to quiet infos on parameter changes
+    if "verbose" in the_parameters:
+        set_parameter(lp, "verbose", the_parameters["verbose"])
+    for k, v in iteritems(the_parameters):
+        set_parameter(lp, k, v)
 
 
     # Create variables
     #TODO:  Speed this up
-    variable_list = [lp.addVar(float(x.lower_bound),
-                               float(x.upper_bound),
+    variable_list = [lp.addVar(_float(x.lower_bound),
+                               _float(x.upper_bound),
                                float(x.objective_coefficient),
                                variable_kind_dict[x.variable_kind],
-                               x.id)
-                     for x in cobra_model.reactions]
+                               str(i))
+                     for i, x in enumerate(cobra_model.reactions)]
     reaction_to_variable = dict(zip(cobra_model.reactions,
                                     variable_list))
     # Integrate new variables
     lp.update()
-    #Set objective to quadratic program
-    if quadratic_component is not None:
-        if not hasattr(quadratic_component, 'todok'):
-            raise Exception('quadratic component must have method todok')
 
-        quadratic_objective = QuadExpr()
-        for (index_0, index_1), the_value in quadratic_component.todok().items():
-            quadratic_objective.addTerms(the_value,
-                                   variable_list[index_0],
-                                   variable_list[index_1])
-        #Does this override the linear objective coefficients or integrate with them?
-        lp.setObjective(quadratic_objective, sense=objective_sense)
     #Constraints are based on mass balance
     #Construct the lin expression lists and then add
     #TODO: Speed this up as it takes about .18 seconds
     #HERE
-    for the_metabolite in cobra_model.metabolites:
+    for i, the_metabolite in enumerate(cobra_model.metabolites):
         constraint_coefficients = []
         constraint_variables = []
         for the_reaction in the_metabolite._reaction:
-            constraint_coefficients.append(the_reaction._metabolites[the_metabolite])
+            constraint_coefficients.append(_float(the_reaction._metabolites[the_metabolite]))
             constraint_variables.append(reaction_to_variable[the_reaction])
         #Add the metabolite to the problem
         lp.addConstr(LinExpr(constraint_coefficients, constraint_variables),
                      sense_dict[the_metabolite._constraint_sense.upper()],
                      the_metabolite._bound,
-                     the_metabolite.id)
+                     str(i))
 
+    # Set objective to quadratic program
+    if quadratic_component is not None:
+        set_quadratic_objective(lp, quadratic_component)
 
-
+    lp.update()
     return(lp)
-###
 
-###
+
+def set_quadratic_objective(lp, quadratic_objective):
+    if not hasattr(quadratic_objective, 'todok'):
+        raise Exception('quadratic component must have method todok')
+    variable_list = lp.getVars()
+    linear_objective = lp.getObjective()
+    # If there already was a quadratic expression set, this will be quadratic
+    # and we need to extract the linear component
+    if hasattr(linear_objective, "getLinExpr"):  # duck typing
+        linear_objective = linear_objective.getLinExpr()
+    gur_quadratic_objective = QuadExpr()
+    for (index_0, index_1), the_value in quadratic_objective.todok().items():
+        # gurobi does not multiply by 1/2 (only does v^T Q v)
+        gur_quadratic_objective.addTerms(the_value * 0.5,
+                                         variable_list[index_0],
+                                         variable_list[index_1])
+    # this adds to the existing quadratic objectives
+    lp.setObjective(gur_quadratic_objective + linear_objective)
+
 def solve_problem(lp, **kwargs):
     """A performance tunable method for updating a model problem file
 
     """
     #Update parameter settings if provided
-    if kwargs:
-        [set_parameter(lp, parameter_mappings[k], v)
-         for k, v in kwargs.iteritems() if k in parameter_mappings]
+    for k, v in iteritems(kwargs):
+        set_parameter(lp, k, v)
 
-    try:
-        print_solver_time = kwargs['print_solver_time']
-        start_time = time()
-    except:
-        print_solver_time = False
     lp.update()
-    #Different methods to try if lp_method fails
     lp.optimize()
     status = get_status(lp)
-    if print_solver_time:
-        print 'optimize time: %f'%(time() - start_time)
     return status
 
-    
+
 def solve(cobra_model, **kwargs):
     """
 
     """
-    #Start out with default parameters and then modify if
-    #new onese are provided
-    the_parameters = deepcopy(parameter_defaults)
-    if kwargs:
-        the_parameters.update(kwargs)
-    #Update objectives if they are new.
-    if 'new_objective' in the_parameters and \
-           the_parameters['new_objective'] not in ['update problem', None]:
-       update_objective(cobra_model, the_parameters['new_objective'])
+    for i in ["new_objective", "update_problem", "the_problem"]:
+        if i in kwargs:
+            raise Exception("Option %s removed" % i)
+    if 'error_reporting' in kwargs:
+        warn("error_reporting deprecated")
+        kwargs.pop('error_reporting')
 
-    if 'the_problem' in the_parameters:
-        the_problem = the_parameters['the_problem']
-    else:
-        the_problem = None
-    if 'error_reporting' in the_parameters:
-        error_reporting = the_parameters['error_reporting']
-    else:
-        error_reporting = False
-
-    if isinstance(the_problem, __solver_class):
-        #Update the problem with the current cobra_model
-        lp = the_problem
-        update_problem(lp, cobra_model, **the_parameters)
-    else:
-        #Create a new problem
-        lp = create_problem(cobra_model, **the_parameters)
-    #Deprecated way for returning a solver problem created from a cobra_model
-    #without performing optimization
-    if the_problem == 'setup':
-            return lp
+    #Create a new problem
+    lp = create_problem(cobra_model, **kwargs)
 
     ###Try to solve the problem using other methods if the first method doesn't work
     try:
-        lp_method = the_parameters['lp_method']
+        lp_method = kwargs['lp_method']
     except:
         lp_method = 0
     the_methods = [0, 2, 1]
@@ -333,17 +289,11 @@ def solve(cobra_model, **kwargs):
     #Start with the user specified method
     the_methods.insert(0, lp_method)
     for the_method in the_methods:
-        the_parameters['lp_method'] = the_method
         try:
-            status = solve_problem(lp, **the_parameters)
+            status = solve_problem(lp, lp_method=the_method)
         except:
             status = 'failed'
         if status == 'optimal':
             break
-    status = solve_problem(lp, **the_parameters)
-    the_solution = format_solution(lp, cobra_model)
-    if status != 'optimal' and error_reporting:
-        print '%s failed: %s'%(solver_name, status)
-    cobra_model.solution = the_solution
-    solution = {'the_problem': lp, 'the_solution': the_solution}
-    return solution
+
+    return format_solution(lp, cobra_model)

@@ -1,20 +1,43 @@
 language: python
-#python:
-# - "2.6"
-# - "2.7"
+sudo: false
+cache:
+  directories:
+    - $HOME/.cache/pip
+python:
+  - "2.7"
+  - "3.4"
+  - "3.5"
+addons:
+  apt:
+    packages:
+      - gfortran
+      - libatlas-dev
+      - libatlas-base-dev
+      - liblapack-dev
+      - libgmp-dev
+      - libglpk-dev
+      - libmpfr-dev
+
 # command to install dependencies
-virtualenv:
-  system_site_packages: true
+env:
+  - PIP_CACHE_DIR=$HOME/.cache/pip
 before_install:
-  - sudo apt-get install libglpk-dev python-scipy libgmp-dev
-  - cd /home/travis
-  - wget http://clostridium.ucsd.edu/libSBML-5.9.0_compiled.tar.gz
-  - tar xzf libSBML-5.9.0_compiled.tar.gz
-  - cd libSBML-5.9.0-Source
-  - sudo make install
-  - cd $TRAVIS_BUILD_DIR
+  - pip install pip --upgrade
+  # These get cached
+  - pip install numpy scipy python-libsbml cython coveralls jsonschema six matplotlib pandas
+  - if [[ $TRAVIS_PYTHON_VERSION == 2* ]]; then pip install lxml glpk pep8 palettable; fi
+  # Download esolver and add it to the path
+  - wget https://opencobra.github.io/pypi_cobrapy_travis/esolver.gz
+  - gzip -d esolver.gz; chmod +x esolver; export PATH=$PATH:$PWD
+  - mkdir -p $HOME/.config/matplotlib
+  - "echo 'backend: Agg' >> $HOME/.config/matplotlib/matplotlibrc"
 install:
-  - ln -s /usr/lib/python2.7/dist-packages/scipy ~/virtualenv/python2.7/lib/python2.7/site-packages/
-  - pip install glpk 
+  - python setup.py develop
 # # command to run tests
-script: python setup.py test
+script:
+  - coverage run --source=cobra setup.py test
+  - if [[ $TRAVIS_PYTHON_VERSION == 2* ]]; then
+    pep8 cobra --exclude=oven,solvers,sbml.py --show-source;
+    fi
+after_success:
+  - coveralls

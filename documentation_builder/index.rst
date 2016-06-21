@@ -1,22 +1,30 @@
 Documentation for COBRApy
 =========================
+For installation instructions, please see `INSTALL.md
+<https://github.com/opencobra/cobrapy/blob/master/INSTALL.md>`_.
+
+Many of the examples below are viewable as IPython notebooks, which can
+be viewed at `nbviewer
+<http://nbviewer.ipython.org/github/opencobra/cobrapy/tree/master/documentation_builder/>`_.
+
 .. toctree::
     :numbered:
     :maxdepth: 2
 
-    introduction
-    reactions
-    metabolites
-    01_create_model
-    02_read_simulate_write
-    03_single_deletion
-    04_change_objective
-    05_add_reactions
-    06_ice_cream_milp
-    visbio
+    getting_started
+    building_model
+    io
+    simulating
+    deletions
+    phenotype_phase_plane
+    milp
+    qp
+    loopless
+    gapfilling
+    solvers
+    pymatbridge
+    faq
     cobra
-
-
 
 
 Indices and tables

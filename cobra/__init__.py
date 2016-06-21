@@ -1,22 +1,30 @@
-import sys
-from version import get_version
-__version__ = get_version()
-from os import name as __name
-from core import Object, Formula, Metabolite, Gene, Reaction, Model, DictList, Species
-if __name == 'java':
-    #raise Exception("Experimental modules of numpy/scipy for java that are" +\
-    #"not yet ready for prime time.")
-    #import oven.danielhyduke.jython.numpy as numpy
-    #import oven.danielhyduke.jython.scipy as scipy
-    from warnings import warn
-    warn("COBRA for Python is not optimized for JAVA.  If it's slow or crashes consider increasing JVM memory")
-else:
-    try:
-        from core import ArrayBasedModel
-    except Exception, e:
-        from warnings import warn
-        warn("cobra.ArrayBasedModel class is unavailable: %s"%repr(e))
+# set the warning format to be on a single line
+import warnings as _warnings
+from os.path import abspath as _abspath, dirname as _dirname
+from os import name as _name
 
-del __name, get_version
-__doc__ = """
-"""
+from .version import get_version
+from .core import Object, Metabolite, Gene, Reaction, Model, \
+    DictList, Species
+from . import io, flux_analysis, design
+
+try:
+    from .core import ArrayBasedModel
+except ImportError:
+    None
+
+__version__ = get_version()
+del get_version
+
+# set the warning format to be prettier and fit on one line
+_cobra_path = _dirname(_abspath(__file__))
+if _name == "posix":
+    _warning_base = "%s:%s \x1b[1;31m%s\x1b[0m: %s\n"  # colors
+else:
+    _warning_base = "%s:%s %s: %s\n"
+
+
+def _warn_format(message, category, filename, lineno, file=None, line=None):
+    shortname = filename.replace(_cobra_path, "cobra", 1)
+    return _warning_base % (shortname, lineno, category.__name__, message)
+_warnings.formatwarning = _warn_format

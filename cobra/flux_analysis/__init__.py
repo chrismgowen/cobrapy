@@ -1,36 +1,20 @@
 try:
-    from essentiality import assess_medium_component_essentiality
-except Exception, e:
-    from warnings import warn
-    warn("essentiality is not accessible: %s"%e)
-try:
-    from variability import flux_variability_analysis
-except Exception, e:
-    from warnings import warn
-    warn("variability is not accessible: %s"%e)
-try:
-    from single_deletion import single_deletion
-except Exception, e:
-    from warnings import warn
-    warn("single_deletion is not accessible: %s"%e)
+    import numpy
+except:
+    numpy = None
 
+from .essentiality import assess_medium_component_essentiality
+from .variability import flux_variability_analysis, find_blocked_reactions
+from .single_deletion import single_gene_deletion, single_reaction_deletion
+from .parsimonious import optimize_minimal_flux
+from .loopless import construct_loopless_model
+from .gapfilling import growMatch
 
-from os import name as __name
-from warnings import warn
-if __name == 'java':
-    warn('double_deletion functions and moma are not yet supported on %s'%__name)
+if numpy:
+    from .double_deletion import double_reaction_deletion, double_gene_deletion
+    from .phenotype_phase_plane import calculate_phenotype_phase_plane
 else:
-    try:
-        from double_deletion import double_deletion
-    except Exception, e:
-        from warnings import warn
-        warn("double_deletion is not accessible: %s"%e)
-
-    
-
-
-
-
-
-
-
+    from warnings import warn
+    warn("double deletions and phase planes requires numpy")
+    del warn
+del numpy

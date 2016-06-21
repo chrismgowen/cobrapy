@@ -1,123 +1,123 @@
-# attempt to import all working solvers in this directory
+# Solvers are expected to follow the following interface
+# create_problem: makes a solver problem object from a cobra.model and
+# sets parameters (if possible)
+
+# format_solution: Returns a cobra.Solution object.  This is where one
+# should dress the cobra.model with results if desired.
+
+# get_status: converts a solver specific status flag to a cobra pie flag.
+
+# set_parameter: takes solver specific parameter strings and sets them.
+
+# solve: solves the optimization problem.  this is where one should put
+# in logic on what to try if the problem
+# isn't optimal
+
+# solve_problem: dumb and fast which will set parameters, if provided
+
+# update_problem: changes bounds and linear objective coefficient of the
+# solver specific problem file, given the complementary cobra.model
+
+# This attempts to import all working solvers in this directory
+
 from __future__ import absolute_import
-from os import name as __name
-from sys import modules as __modules
 from warnings import warn
+from os import listdir, path
 
-__legacy_solver = False 
 solver_dict = {}
-if __legacy_solver:
-    from .legacy import _optimize_glpk, _optimize_gurobi, _optimize_cplex
-    package_dict = {'glpk': 'from glpk import LPX',
-                    'cplex': 'from cplex import Cplex',
-                    'gurobi': 'from gurobipy import Model'}
-    if __name == 'java':
-        from .legacy_jython import _optimize_glpk
-        package_dict['glpk'] = 'from org.gnu.glpk import GLPK'
-        package_dict['gurobi'] = 'from gurobi import GRBModel'
+possible_solvers = set()
 
 
-    solver_dict = {'glpk': _optimize_glpk,
-                   'gurobi': _optimize_gurobi,
-                   'cplex': _optimize_cplex}
+def add_solver(solver_name, use_name=None):
+    """add a solver module to the solvers"""
+    exec("from . import " + solver_name)
+    solver = eval(solver_name)
+    if use_name is None:
+        if hasattr(solver, "solver_name"):
+            use_name = solver.solver_name
+        else:
+            use_name = solver_name
+    solver_dict[use_name] = eval(solver_name)
 
-    for solver_name, solver_import in package_dict.iteritems():
-        try:
-            exec(solver_import)
-        except Exception, e:
-            #print e
-            solver_dict.pop(solver_name)
-else:
-    #TODO: Enforce the solver interface
-    ## create_problem: makes a solver problem object from a cobra.model and
-    ## sets parameters (if possible)
+for i in listdir(path.dirname(path.abspath(__file__))):
+    if i.startswith("_") or i.startswith(".") or i.startswith('legacy'):
+        continue
+    if i.startswith("parameters"):
+        continue
+    if i.endswith(".py") or i.endswith(".so") or i.endswith(".pyc") \
+            or i.endswith(".pyd"):
+        possible_solvers.add(i.split(".")[0])
 
-    ## format_solution: Returns a cobra.Solution object.  This is where one
-    ## should dress the cobra.model with results if desired.
+if "wrappers" in possible_solvers:
+    possible_solvers.remove("wrappers")
 
-    ## get_status: converts a solver specific status flag to a cobra pie flag.
+for solver in possible_solvers:
+    try:
+        add_solver(solver)
+    except:
+        pass
+    del solver
 
-    ## set_parameter: takes solver specific parameter strings and sets them.
+if len(solver_dict) == 0:
+    warn("No LP solvers found")
 
-    ## solve: solves the optimization problem.  this is where one should put
-    ## in logic on what to try if the problem
-    ## isn't optimal
+# clean up the namespace
+del path, listdir, warn, i, possible_solvers
 
-    ## solve_problem: dumb and fast which will set parameters, if provided
-    ##note that for some solvers
 
-    ## update_problem: changes bounds and linear objective coefficient of the
-    ## solver specific problem file, given the complementary cobra.mod
-    from os import listdir as _listdir
-    from os import path as _path
-    for i in _listdir(_path.split(_path.abspath(__file__))[0]):
-        if i.startswith("_") or i.startswith(".") or i == 'legacy.py':
-            continue
-        if not i.endswith(".py"):
-            continue
-        try:
-            m = i.strip(".py")
-            exec("from . import %s" % m)
-            solver_name = m
-            if solver_name.endswith('_solver'):
-                solver_name = solver_name[:-len('_solver')]
-            solver_dict[solver_name] = eval(m)
-        except Exception, e:
-            pass
-    del _path
-    del _listdir
-    del i
-    m = None
-    del m
+class SolverNotFound(Exception):
+    None
 
-def optimize(cobra_model, solver='glpk', error_reporting=True, **kwargs):
+
+def get_solver_name(mip=False, qp=False):
+    """returns a solver name
+
+    raises SolverNotFound if a suitable solver is not found
+    """
+    if len(solver_dict) == 0:
+        raise SolverNotFound("no solvers installed")
+    # glpk only does lp, not qp. Gurobi and cplex are better at mip
+    mip_order = ["gurobi", "cplex", "mosek", "coin", "cglpk", "glpk"]
+    lp_order = ["cglpk", "cplex",  "gurobi", "mosek", "coin", "glpk"]
+    qp_order = ["gurobi", "cplex", "mosek"]
+
+    if mip is False and qp is False:
+        for solver_name in lp_order:
+            if solver_name in solver_dict:
+                return solver_name
+        # none of them are in the list order - so return the first one
+        return list(solver_dict)[0]
+    elif qp:  # mip does not yet matter for this determination
+        for solver_name in qp_order:
+            if solver_name in solver_dict:
+                return solver_name
+        # see if any solver defines set_quadratic_objective
+        for solver_name in solver_dict:
+            if hasattr(solver_dict[solver_name], "set_quadratic_objective"):
+                return solver_name
+        raise SolverNotFound("no qp-capable solver found")
+    else:
+        for solver_name in mip_order:
+            if solver_name in solver_dict:
+                return solver_name
+        for solver_name in solver_dict:
+            if hasattr(solver_dict[solver_name], "_SUPPORTS_MIP"):
+                return solver_name
+    raise SolverNotFound("no mip-capable solver found")
+
+
+def optimize(cobra_model, solver=None, **kwargs):
     """Wrapper to optimization solvers
 
+    solver : str
+        Name of the LP solver from solver_dict to use. If None is given, the
+        default one will be used
 
     """
-    #If the default solver is not installed then use one of the others
-    try:
-        solver_function = solver_dict[solver]
-    except:
-        try:
-            solver, solver_function = solver_dict.items()[0]
-        except:
-            raise Exception("It appears that you do not have one of the supported solvers "+\
-                            "(glpk, gurobi, or cplex) installed")
-    the_solution = None
-    if __legacy_solver:
-        def solve_problem(solver_function, kwargs):
-            return solver_function(cobra_model, **kwargs)
-        try:
-            the_solution = solve_problem(solver_function, kwargs)
-        except Exception, e:
-            if error_reporting:
-                print e
-                print '%s did not work'%solver
-            solver_keys = solver_dict.keys()
-            solver_keys.remove(solver)
-            for solver in solver_keys:
-                solver_function = solver_dict[solver]
-                try:
-                    if error_reporting:
-                        print "now trying %s"%solver
-                    the_solution = solve_problem(solver_function, kwargs)
-                    break
-                except Exception, e:
-                    if error_reporting:
-                        print e
-                        print '%s did not work'%solver
-                    continue
+    # If the default solver is not installed then use one of the others
+    if solver is None:
+        qp = "quadratic_component" in kwargs and \
+            kwargs["quadratic_component"] is not None
+        solver = get_solver_name(qp=qp)
 
-    else:
-        the_solution = solver_function.solve(cobra_model, **kwargs)
-        #raise Exception("New style solvers not yet fully implemented")
-
-
-    #Add the solution to the model.
-    #if the_solution is None:
-    #   return(the_solution)
-    #else:
-    return(the_solution['the_problem'])
-
-del __name
+    return solver_dict[solver].solve(cobra_model, **kwargs)
